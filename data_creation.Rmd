@@ -1,0 +1,249 @@
+---
+title: "Mock Data"
+output: html_notebook
+---
+
+Below is the basic code for mock data. As health-related data typically swarms with privacy-related issues, I'm taking my old-school data science homework approach and creating a fake dataset that we could use as an example. To be honest, I wonder how much of this effort will really benefit others now with the creation of LLMs, but here goes nothing nonetheless. 
+
+The goal is as follows:
+
+1. a table of patient id along with basic demographic and clinical data. each row is that of a unique patient, derive the variables that are relevant to tb. 
+2. a table showing, per quarter, a number of times a patient has visited the hospital. this should be for a period of 5 years, or 20 quarters. 
+
+Patient demographics: For the demographic/clinical table,
+Age, sex, BMI
+TB type (pulmonary vs extrapulmonary)
+Drug resistance status (drug-sensitive, MDR, XDR)
+HIV co-infection status - maybe not since this is south korea
+Treatment outcome (cured, completed, failed, died, lost to follow-up)
+Baseline chest X-ray severity score
+Baseline sputum smear status
+Socioeconomic indicators (education, employment)
+
+Trajectory
+
+Group 1: High initial visits tapering to low (typical recovery)
+Group 2: Consistently low visits (good adherence, no complications)
+Group 3: Moderate visits with periodic spikes (intermittent complications)
+Group 4: Persistently high visits (poor outcomes/complications)
+
+Visit frequency
+What would be realistic quarterly visit counts? 
+
+As we are going to be applying group-based trajectory modeling, the general approach behind the creation of the mock data will follow the p
+
+I'm going to define 4 semi-realistic trajectory groups that come from empirical experience of observing tuberculosis patients in an intermediate-burden country such as South Korea. 
+1. high -> low; 40%
+2. consistently low; 25%
+3. moderate, with "random" spikes representing periodic complications; 30%
+  The reason for abnormally high rate here is to make it more challenging for methods such as GBTM to capture. As we'll discuss later in the main article, GBTM attempts to generalize the groups into latent classes based on the longitudinal trend of a certain outcome variable. this means that a spike that is truly random is harder to capture as opposed to a more generalizable trend like the other 3. 
+4. persistently high; 5%
+
+Then, in order to make the observation more realistic, I'm going to influence the original trend of the 4 groups above with the randomly assigned demographic and clinical characteristics of the individual. this will allow us to explore the "reason" of group assignment. 
+```{r}
+library(tidyverse)
+library(MASS)
+set.seed(1008)
+
+num_patients <- 10000
+num_quarters <- 20 # 5 years
+
+group_ratio <- c(0.4, 0.25, 0.3, 0.05)
+trajectory <- sample(1:4, num_patients, replace = TRUE, prob = group_ratio)
+```
+
+```{r}
+patient_demographics <- function(n, grp) {
+  
+  # demographics
+  age <- round(rnorm(n, mean = 55, sd = 12)) # avg age for tb patients in korea is 50-60, but increasing
+  age <- pmax(18, pmin(90, age))  # lowest is 18, highest should be around ~90
+  
+  sex <- sample(c("male", "female"), n, replace = TRUE, prob = c(0.6, 0.4))
+  
+  bmi <- rnorm(n, mean = 22, sd = 4)
+  # severe tb is linked with lower BMI
+  bmi_adj <- case_when(
+    grp == 1 ~ 0,
+    grp == 2 ~ 1,
+    grp == 3 ~ -1,
+    grp == 4 ~ -3
+  )
+  bmi <- round(pmax(15, bmi + bmi_adj), 1)
+  
+  # extrapulmonary tb is more difficult to treat
+  tb_type_prob <- case_when(
+    grp == 1 ~ 0.85, 
+    grp == 2 ~ 0.95,   
+    grp == 3 ~ 0.75, 
+    grp == 4 ~ 0.60
+  )
+  tb_type <- map2_chr(tb_type_prob, runif(n), ~ifelse(.y < .x, "Pulmonary", "Extrapulmonary"))
+  
+  # drug resistance is likely higher in worse outcomes
+  dr_prob <- list(
+    c(0.85, 0.12, 0.03), 
+    c(0.90, 0.08, 0.02), 
+    c(0.75, 0.20, 0.05), 
+    c(0.60, 0.30, 0.10)   
+  )
+  drug_resistance <- character(n)
+  for(i in 1:n) {
+    probs <- dr_prob[[grp[i]]]
+    drug_resistance[i] <- sample(c("Drug-sensitive", "MDR", "XDR"), 1, prob = probs)
+  }
+  
+  # treatment outcomes are strongly associated with trajectories
+  # this will not be used for modeling, but it will be data that is present in a retrospective clinical database
+  outcome_probs <- list(
+    c(0.70, 0.25, 0.03, 0.01, 0.01), 
+    c(0.80, 0.18, 0.01, 0.005, 0.005), 
+    c(0.40, 0.35, 0.15, 0.05, 0.05),
+    c(0.20, 0.20, 0.25, 0.20, 0.15)  
+  )
+  treatment_outcome <- character(n)
+  for(i in 1:n) {
+    probs <- outcome_probs[[grp[i]]]
+    treatment_outcome[i] <- sample(c("Cured", "Completed", "Failed", "Died", "Lost to follow-up"), 
+                                 1, prob = probs)
+  }
+  
+  cxr_severity_probs <- list(
+    c(0.4, 0.4, 0.15, 0.05),  
+    c(0.5, 0.35, 0.12, 0.03), 
+    c(0.25, 0.35, 0.3, 0.1), 
+    c(0.1, 0.2, 0.4, 0.3)  
+  )
+  cxr_severity <- numeric(n)
+  for(i in 1:n) {
+    probs <- cxr_severity_probs[[grp[i]]]
+    cxr_severity[i] <- sample(1:4, 1, prob = probs)
+  }
+  
+  # Baseline sputum smear
+  smear_prob <- case_when(
+    grp == 1 ~ 0.60,
+    grp == 2 ~ 0.55,
+    grp == 3 ~ 0.70,
+    grp == 4 ~ 0.80
+  )
+  sputum_smear <- map2_chr(smear_prob, runif(n), ~ifelse(.y < .x, "Positive", "Negative"))
+  
+  # Education
+  education <- sample(c("None", "Primary", "Secondary", "Tertiary"), n, 
+                     replace = TRUE, prob = c(0.1, 0.2, 0.6, 0.1))
+  
+  # Employment
+  employment <- sample(c("Employed", "Unemployed", "Student", "Retired"), n,
+                      replace = TRUE, prob = c(0.55, 0.2, 0.05, 0.20))
+  
+  demographics_table <- tibble(
+    patient_id = paste0("TB", str_pad(1:n, 5, pad = "0")),
+    age = age,
+    sex = sex,
+    bmi = bmi,
+    tb_type = tb_type,
+    drug_resistance = drug_resistance,
+    treatment_outcome = treatment_outcome,
+    baseline_cxr_severity = cxr_severity,
+    baseline_sputum_smear = sputum_smear,
+    education_level = education,
+    employment_status = employment,
+    trajectory_group = grp  # remove later
+  )
+  
+  return(demographics_table)
+}
+```
+
+```{r}
+visit_trajectories <- function(n, grp) {
+  
+  visits_data <- tibble()
+  
+  for(i in 1:length(grp)) {
+    patient_id <- paste0("TB", str_pad(i, 5, pad = "0"))
+    group <- grp[i]
+    
+    # simple if/else using group 
+    if(group == 1) { # exponential decay; high visits -> low
+      base_pattern <- 8 * exp(-0.15 * (1:n - 1)) + 1
+      noise_sd <- 1.5
+      
+    } else if(group == 2) { # consistently low
+      base_pattern <- rep(2, n) + 0.5 * sin(2 * pi * (1:n) / 4)
+      noise_sd <- 1.0
+      
+    } else if(group == 3) { # moderate with spikes 
+      base_pattern <- 4 + 2 * sin(2 * pi * (1:n) / 4)
+      spike_quarters <- sample(1:n, size = sample(2:5, 1))
+      base_pattern[spike_quarters] <- base_pattern[spike_quarters] + sample(4:8, length(spike_quarters), replace = TRUE)
+      noise_sd <- 2.0
+      
+    } else {  # persistently high
+      base_pattern <- 8 + 2 * sin(2 * pi * (1:n) / 6) + 0.1 * (1:n)  # slight increase over time
+      noise_sd <- 2.5
+    }
+    
+    # add noise (and ensure not neg)
+    visits <- round(pmax(0, base_pattern + rnorm(n, 0, noise_sd)))
+    
+    patient_visits <- tibble(
+      patient_id = patient_id,
+      year = rep(1:5, each = 4),
+      quarter = rep(1:4, times = 5),
+      quarter_id = 1:n,
+      hospital_visits = visits
+    )
+    
+    visits_data <- bind_rows(visits_data, patient_visits)
+  }
+  
+  return(visits_data)
+}
+
+```
+
+```{r}
+patient_demographics <- patient_demographics(n = num_patients, grp = trajectory)
+quarterly_visits <- visit_trajectories(n=num_quarters, grp=trajectory)
+```
+
+```{r}
+cat("1. PATIENT DEMOGRAPHICS TABLE:\n")
+# dim
+## row; num patients
+nrow(patient_demographics)
+## col; num variables
+ncol(patient_demographics)
+names(patient_demographics)
+
+# visits
+nrow(quarterly_visits)
+names(quarterly_visits)
+
+# dist
+print(table(patient_demographics$trajectory_groups))
+
+visit_summary <- quarterly_visits %>%
+  left_join(
+    patient_demographics %>% 
+      dplyr::select(patient_id, trajectory_group)
+    , by = "patient_id") %>%
+  group_by(trajectory_group) %>%
+  summarise(
+    mean_visits = round(mean(hospital_visits), 2),
+    median_visits = median(hospital_visits),
+    min_visits = min(hospital_visits),
+    max_visits = max(hospital_visits),
+    sd_visits = round(sd(hospital_visits), 2),
+    .groups = "drop"
+  )
+print(visit_summary)
+
+# overview
+print(head(patient_demographics, 10))
+
+print(head(quarterly_visits, 10))
+```
+
