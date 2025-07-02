@@ -53,7 +53,7 @@ trajectory <- sample(1:4, num_patients, replace = TRUE, prob = group_ratio)
 ```
 
 ```{r}
-patient_demographics <- function(n, grp) {
+generate_demographics <- function(n, grp) {
   
   # demographics
   age <- round(rnorm(n, mean = 55, sd = 12)) # avg age for tb patients in korea is 50-60, but increasing
@@ -149,7 +149,7 @@ patient_demographics <- function(n, grp) {
     baseline_sputum_smear = sputum_smear,
     education_level = education,
     employment_status = employment,
-    trajectory_group = grp  # remove later
+    trajectory_group = as.factor(grp)  # remove later
   )
   
   return(demographics_table)
@@ -176,13 +176,16 @@ visit_trajectories <- function(n, grp) {
       
     } else if(group == 3) { # moderate with spikes 
       base_pattern <- 4 + 2 * sin(2 * pi * (1:n) / 4)
-      spike_quarters <- sample(1:n, size = sample(2:5, 1))
-      base_pattern[spike_quarters] <- base_pattern[spike_quarters] + sample(4:8, length(spike_quarters), replace = TRUE)
-      noise_sd <- 2.0
-      
+      n_spike <- sample(0:2, 1, prob = c(0.3, 0.5, 0.2))
+      if (n_spike > 0) {
+        spike_quarters <- sample(1:n, size = n_spike)
+        base_pattern[spike_quarters] <- base_pattern[spike_quarters] + sample(4:8, n_spike, replace = TRUE)
+      }
+      noise_sd <- 1.0 # 2.0
+
     } else {  # persistently high
       base_pattern <- 8 + 2 * sin(2 * pi * (1:n) / 6) + 0.1 * (1:n)  # slight increase over time
-      noise_sd <- 2.5
+      noise_sd <- 1.5 # 2.5
     }
     
     # add noise (and ensure not neg)
@@ -201,16 +204,55 @@ visit_trajectories <- function(n, grp) {
   
   return(visits_data)
 }
-
 ```
 
 ```{r}
-patient_demographics <- patient_demographics(n = num_patients, grp = trajectory)
-quarterly_visits <- visit_trajectories(n=num_quarters, grp=trajectory)
+patient_demographics <- generate_demographics(n = num_patients, grp = trajectory)
+quarterly_visits <- visit_trajectories(n = num_quarters, grp = trajectory)
+```
+
+So what do the trajectories actually look like?
+```{r}
+# I know that patient 1, 3, 5, and 8 belong to trajectory groups 3, 2, 1, and 4,  respectively
+sample_plot_data <- quarterly_visits %>%
+  inner_join(
+    patient_demographics %>%
+      filter(patient_id %in% c('TB00001', 'TB00003', 'TB00005', 'TB00008')) %>%
+      dplyr::select(patient_id, trajectory_group),
+    by = "patient_id"
+  )
+
+ggplot(data = sample_plot_data, aes(x=quarter_id, y = hospital_visits, color = trajectory_group)) + 
+  geom_line(size=1.2) +
+  labs(title = "Group-based Hospital Visits (Post-Treatment)",
+       x = "Quarter (since treatment)",
+       y = "Number of Visits") +
+  theme_minimal()
 ```
 
 ```{r}
-cat("1. PATIENT DEMOGRAPHICS TABLE:\n")
+traj_plot_data <- quarterly_visits %>%
+  left_join(
+    patient_demographics %>% 
+      dplyr::select(patient_id, trajectory_group),
+    by = "patient_id"
+  ) %>%
+  mutate(trajectory_group = as.factor(trajectory_group)) %>%
+  group_by(trajectory_group, quarter_id) %>%
+  summarise(
+    mean_visits = mean(hospital_visits)
+  )
+
+ggplot(data = traj_plot_data, aes(x=quarter_id, y = mean_visits, color = trajectory_group)) +
+  geom_line(size=1.2) +
+  labs(title = "Group-based Hospital Visits (Post-Treatment)",
+       x = "Quarter (since treatment)",
+       y = "Number of Visits (mean)") +
+  theme_minimal()
+```
+
+
+```{r}
 # dim
 ## row; num patients
 nrow(patient_demographics)
@@ -245,5 +287,90 @@ print(visit_summary)
 print(head(patient_demographics, 10))
 
 print(head(quarterly_visits, 10))
+```
+Patient characteristics by trajectory group
+```{r}
+names(patient_demographics)
+head(patient_demographics)
+
+# continuous
+# age
+patient_demographics %>%
+  group_by(trajectory_group) %>%
+  summarise(
+      age_mean = round(mean(age), 1),
+      age_sd = round(sd(age), 1),
+      age_q1 = quantile(age, 0.25),
+      age_median = median(age),
+      age_q3 = quantile(age, 0.75)
+  )
+
+# bmi
+patient_demographics %>%
+  group_by(trajectory_group) %>%
+  summarise(
+      bmi_mean = round(mean(bmi), 1),
+      bmi_sd = round(sd(bmi), 1),
+      bmi_q1 = quantile(bmi, 0.25),
+      bmi_median = median(bmi),
+      bmi_q3 = quantile(bmi, 0.75)
+  )
+
+# cxr
+patient_demographics %>%
+  group_by(trajectory_group) %>%
+  summarise(
+      cxr_mean = round(mean(baseline_cxr_severity), 1),
+      cxr_sd = round(sd(baseline_cxr_severity), 1),
+      cxr_q1 = quantile(baseline_cxr_severity, 0.25),
+      cxr_median = median(baseline_cxr_severity),
+      cxr_q3 = quantile(baseline_cxr_severity, 0.75)
+  )
+
+
+# categorical
+create_detailed_summary <- function(data) {
+  
+  categorical_summary <- data %>%
+    dplyr::select(trajectory_group, sex, tb_type, drug_resistance, 
+                  treatment_outcome, baseline_sputum_smear, education_level, employment_status) %>%
+    pivot_longer(-trajectory_group, names_to = "variable", values_to = "value") %>%
+    count(trajectory_group, variable, value) %>%
+    group_by(trajectory_group, variable) %>%
+    mutate(
+      total = sum(n),
+      perc = round(100 * n / total, 1)
+    ) %>%
+    ungroup()
+  
+  return(categorical_summary)
+}
+
+summary_stats <- create_detailed_summary(patient_demographics)
+
+variables_to_display <- c("sex", "tb_type", "drug_resistance",
+                         "treatment_outcome", "baseline_sputum_smear", 
+                         "education_level", "employment_status")
+
+for(var in variables_to_display) {
+  var_summary <- summary_stats %>%
+    filter(variable == var) %>%
+    dplyr::select(trajectory_group, value, n, perc) %>%
+    arrange(trajectory_group, value)
+  
+  var_wide <- var_summary %>%
+    pivot_wider(names_from = trajectory_group, 
+                values_from = c(n, perc),
+                names_sep = "_traj") %>%
+    arrange(value)
+  
+  print(var_wide)
+}
+
+```
+
+```{r}
+write_csv(patient_demographics, "tb_patient_demographics.csv")
+write_csv(quarterly_visits, "tb_quarterly_visits.csv") 
 ```
 
