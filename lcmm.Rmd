@@ -1,0 +1,337 @@
+---
+title: "GBTM Implementation via LCMM"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(lcmm)
+library(ggplot2)
+library(gridExtra)
+library(knitr)
+library(corrplot)
+
+patient_demographics <- read_csv("tb_patient_demographics.csv")
+quarterly_visits <- read_csv("tb_quarterly_visits.csv")
+```
+
+```{r}
+lcmm_data <- quarterly_visits %>%
+  left_join(patient_demographics, by = "patient_id") %>%
+  arrange(patient_id, quarter_id) %>%
+  mutate(
+    patient_numeric = as.numeric(factor(patient_id)), # forcing to numeric
+    time = quarter_id - 1 # zero indexing
+  ) %>%
+  mutate( # converting (to) binary indicators
+    male = ifelse(sex == "male", 1, 0),
+    ds_tb = ifelse(drug_resistance == "Drug-sensitive", 1, 0), # not distinguishing MDR and XDR
+    lung = ifelse(tb_type == "Pulmonary", 1, 0),
+    sputum = ifelse(baseline_sputum_smear == "Positive", 1, 0)
+  ) %>%
+  # TODO: A more robust missing data processing ** 
+  filter (!is.na(hospital_visits))
+
+nrow(lcmm_data)
+length(unique(quarterly_visits$patient_id)) # any missing?
+length(unique(lcmm_data$patient_id))
+length(unique(lcmm_data$time))
+min(lcmm_data$time)
+max(lcmm_data$time)
+```
+
+Spaghetti plot to observe the trajectories
+```{r}
+# reduce the number of patients observed to actually be able to see 
+sample_patients <- lcmm_data %>%
+  distinct(patient_id) %>%
+  slice_sample(n = 100) %>%  # number sampled here 
+  pull(patient_id)
+
+spaghetti_data <- lcmm_data %>%
+  filter(patient_id %in% sample_patients)
+
+ggplot(spaghetti_data, aes(x = time, y = hospital_visits, group = patient_id)) +
+  geom_line(alpha = 0.3, color = "steelblue") +
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, color = "red", linewidth = 1.5) +
+  labs(
+    title = "Individual Trajectory Patterns, Sampled (n = 100)",
+    x = "Quarters Since Treatment",
+    y = "Number of Hospital Visits"
+  ) +
+  theme_minimal()
+
+ggplot(lcmm_data, aes(x = factor(time), y = hospital_visits)) +
+  geom_boxplot(alpha = 0.7, fill = "lightblue") +
+  labs(
+    title = "Visit Distribution by Time Point",
+    x = "Quarters Since Treatment)",
+    y = "Number of Hospital Visits"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Fitting a model with 1-class, the main question here being 
+"is the 4-class model (to be fit later) superior to the 1-class model?"
+```{r}
+model_1class <- lcmm(
+  hospital_visits ~ time + I(time^2),  # Quadratic time trend
+  subject = "patient_numeric",
+  ng = 1,  # number of classes 
+  data = lcmm_data,
+  link = "linear", # TODO: this can also change, but keep for now
+  verbose = FALSE
+)
+
+# did the model converge?
+model_1class$conv == 1
+# Log-likelihood
+model_1class$loglik
+# AIC
+model_1class$AIC
+# BIC 
+model_1class$BIC
+```
+
+By the virtue of owning the data creation process, I know that the "true" number of latent classes are 4.
+The results should be superior compared to the 1-class model (as well as any other n-class), but that remains to be seen. 
+** Note that a model of this complexity and size (esp bayesian?? (needs verifying)) requires input, B, that provides initial values. 
+```{r}
+set.seed(1008)
+
+model_4class <- lcmm(
+  hospital_visits ~ time + I(time^2),     
+  mixture = ~ time + I(time^2), # different trajectories per class
+  subject = "patient_numeric",
+  ng = 4, # 
+  data = lcmm_data,
+  link = "linear",
+  verbose = TRUE, 
+  maxiter = 200, # increase if the model struggles to converge
+  B = model_1class # **
+)
+
+# did the model converge?
+model_4class$conv == 1
+# Log-likelihood
+model_4class$loglik
+# AIC
+model_4class$AIC
+# BIC 
+model_4class$BIC
+
+summary(model_4class)
+```
+
+now we can look at class assignments to explore 
+```{r}
+# extracting posterior class probabilities
+# it should be (10000, 6), and
+# the columns read as: patient_id, most_likely_class, prob1, prob2, prob3, prob4
+posterior_probs <- model_4class$pprob
+
+# class assignments
+class_assignments <- posterior_probs[, 1:2]  # patient_numeric (patient_id) and predicted class
+colnames(class_assignments) <- c("patient_numeric", "predicted_class")
+
+# class sizes
+table(class_assignments$predicted_class)
+round(prop.table(table(class_assignments$predicted_class)) * 100, 1)
+
+# now that we have the posterior probabilities, it is possible to gauge the "quality" of the classification,
+# first, for each individual patient, extract the predicted class with the highest posterior probability
+# plainly, this means that I am only looking at my confidence level for the class that I am the most confident about
+avg_posterior <- posterior_probs %>%
+  as.data.frame() %>%
+  rowwise() %>%
+  mutate(
+    max_prob = max(c_across(starts_with("prob")), na.rm = TRUE)
+  ) %>%
+  pull(max_prob)
+
+round(mean(avg_posterior, na.rm = TRUE), 3)
+round(median(avg_posterior, na.rm = TRUE), 3)
+# how often are we over .7 confident?
+round(mean(avg_posterior > 0.7, na.rm = TRUE) * 100, 1)
+# how often are we over .9 confident?
+round(mean(avg_posterior > 0.9, na.rm = TRUE) * 100, 1)
+```
+
+```{r}
+# attach the class assignments to the original quality visits data (lcmm_data; long form)
+trajectory_data <- lcmm_data %>%
+  left_join(
+    data.frame(
+      patient_numeric = class_assignments[, "patient_numeric"],
+      predicted_class = as.factor(class_assignments[, "predicted_class"])
+    ),
+    by = "patient_numeric"
+  ) %>%
+  filter(!is.na(predicted_class))
+
+# calculate mean trajectories by class
+mean_trajectories <- trajectory_data %>%
+  group_by(predicted_class, time) %>%
+  summarise(
+    n = n(),
+    mean_visits = mean(hospital_visits, na.rm = TRUE),
+    se_visits = sd(hospital_visits, na.rm = TRUE) / sqrt(n()),
+    lower_ci = mean_visits - 1.96 * se_visits,
+    upper_ci = mean_visits + 1.96 * se_visits,
+    .groups = "drop"
+  )
+
+# sample some patients to overlay individual trajectories
+set.seed(1008)
+sample_by_class <- trajectory_data %>%
+  group_by(predicted_class) %>%
+  slice_sample(n = 30) %>%  # 30 patients per class
+  pull(patient_id)
+indi_patient_data <- trajectory_data %>%
+  filter(patient_id %in% sample_by_class)
+
+
+ggplot() +
+  # individual trajectories
+  geom_line(
+    data = indi_patient_data,
+    aes(x = time, y = hospital_visits, group = patient_id, color = predicted_class),
+    alpha = 0.3, linewidth = 0.3
+  ) +
+  # confidence bands
+  geom_ribbon(
+    data = mean_trajectories,
+    aes(x = time, y = mean_visits, ymin = lower_ci, ymax = upper_ci, fill = predicted_class),
+    alpha = 0.4
+  ) +
+  # mean trajectories
+  geom_line(
+    data = mean_trajectories,
+    aes(x = time, y = mean_visits, color = predicted_class),
+    linewidth = 1.5
+  ) +
+  scale_color_brewer(palette = "Set1", name = "Trajectory Class") +
+  scale_fill_brewer(palette = "Set1", name = "Trajectory Class") +
+  labs(
+    title = "Hospital Visit Trajectories by Latent Class (via LCMM)",
+    x = "Quarters Since Treatment)",
+    y = "Number of Hospital Visits"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+cat("\nTrajectory class characteristics:\n")
+for(class in sort(unique(mean_trajectories$predicted_class))) {
+  class_data <- mean_trajectories %>% filter(predicted_class == class)
+  initial_visits <- class_data$mean_visits[class_data$time == 0]
+  final_visits <- class_data$mean_visits[class_data$time == max(class_data$time)]
+  peak_visits <- max(class_data$mean_visits)
+  
+  cat("Class", class, ":\n")
+  cat("  - Initial visits (Q1):", round(initial_visits, 1), "\n")
+  cat("  - Final visits (Q20):", round(final_visits, 1), "\n")
+  cat("  - Peak visits:", round(peak_visits, 1), "\n")
+  cat("  - Pattern:", ifelse(initial_visits > final_visits, "Decreasing", 
+                           ifelse(initial_visits < final_visits, "Increasing", "Stable")), "\n\n")
+}
+
+```
+
+Now, the most important. Since we have the latent classes, we now look back and attempt to characterize different classes using the baselines characteristics available to us. 
+```{r}
+# attach the class assignments to the original baseline characteristics data (1 row per patient)
+class_characteristics <- patient_demographics %>%
+  mutate(patient_numeric = as.numeric(factor(patient_id))) %>%
+  left_join(
+    data.frame(
+      patient_numeric = class_assignments[, "patient_numeric"],
+      predicted_class = class_assignments[, "predicted_class"]
+    ),
+    by = "patient_numeric"
+  ) %>%
+  filter(!is.na(predicted_class))
+
+# Age
+age_by_class <- class_characteristics %>%
+  group_by(predicted_class) %>%
+  summarise(
+    n = n(),
+    mean_age = round(mean(age, na.rm = TRUE), 1),
+    sd_age = round(sd(age, na.rm = TRUE), 1),
+    median_age = median(age, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(age_by_class)
+
+# Sex
+cat("sex")
+sex_table <- prop.table(table(class_characteristics$predicted_class, 
+                              class_characteristics$sex), 1) * 100
+print(round(sex_table, 1))
+
+# BMI
+bmi_by_class <- class_characteristics %>%
+  group_by(predicted_class) %>%
+  summarise(
+    n = n(),
+    mean_bmi = round(mean(bmi, na.rm = TRUE), 1),
+    sd_bmi = round(sd(bmi, na.rm = TRUE), 1),
+    median_bmi = median(bmi, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(bmi_by_class)
+
+# tb type (pulmonary vs not)
+cat("tb type")
+tb_type_table <- prop.table(table(class_characteristics$predicted_class, 
+                                 class_characteristics$tb_type), 1) * 100
+print(round(tb_type_table, 1))
+
+# drug resistance
+cat("drug resistance")
+dr_table <- prop.table(table(class_characteristics$predicted_class, 
+                            class_characteristics$drug_resistance), 1) * 100
+print(round(dr_table, 1))
+
+# treatment outcome
+cat("outcome")
+outcome_table <- prop.table(table(class_characteristics$predicted_class, 
+                                 class_characteristics$treatment_outcome), 1) * 100
+print(round(outcome_table, 1))
+
+# cxr test result
+cxr_by_class <- class_characteristics %>%
+  group_by(predicted_class) %>%
+  summarise(
+    n = n(),
+    mean_cxr = round(mean(baseline_cxr_severity, na.rm = TRUE), 1),
+    sd_cxr = round(sd(baseline_cxr_severity, na.rm = TRUE), 1),
+    median_cxr = median(baseline_cxr_severity, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(cxr_by_class)
+
+# sputum smear
+cat("sputum")
+sputum_table <- prop.table(table(class_characteristics$predicted_class, 
+                                 class_characteristics$baseline_sputum_smear), 1) * 100
+print(round(sputum_table, 1))
+
+# education level
+cat("education level")
+edu_table <- prop.table(table(class_characteristics$predicted_class, 
+                              class_characteristics$education_level), 1) * 100
+print(round(edu_table, 1))
+
+# employment status
+cat("employment status")
+emp_table <- prop.table(table(class_characteristics$predicted_class, 
+                              class_characteristics$employment_status), 1) * 100
+print(round(emp_table, 1))
+```
+
